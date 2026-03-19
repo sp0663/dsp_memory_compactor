@@ -1,0 +1,5 @@
+numpy
+scipy
+plotly
+pandas
+# cupy-cuda11x  # Uncomment on Kaggle or if you have a compatible Nvidia GPU

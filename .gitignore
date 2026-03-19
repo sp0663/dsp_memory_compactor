@@ -1,0 +1,8 @@
+# create .gitignore and add these lines
+venv/
+__pycache__/
+*.pyc
+.env
+*.wav
+*.csv
+commands.txt
