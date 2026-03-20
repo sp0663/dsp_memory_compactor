@@ -2,6 +2,7 @@
 # FFT analysis, filtering, and signal complexity scoring
 
 import numpy as np
+from scipy.signal import welch
 from utils import get_backend, to_numpy
 
 xp = get_backend()
@@ -29,7 +30,6 @@ def low_pass_filter(signal, sample_rate, cutoff_hz=1000):
     nyq = sample_rate / 2
     normal_cutoff = cutoff_hz / nyq
     b, a = butter(4, normal_cutoff, btype='low', analog=False)
-    # scipy works on numpy arrays
     signal_np = to_numpy(signal)
     filtered = filtfilt(b, a, signal_np)
     return xp.array(filtered)
@@ -51,45 +51,76 @@ def high_pass_filter(signal, sample_rate, cutoff_hz=100):
 
 def compute_snr(signal, sample_rate):
     """
-    Estimate Signal-to-Noise Ratio (SNR) in dB.
-    Uses FFT to separate signal power from noise floor.
+    Estimate Signal-to-Noise Ratio (SNR) in dB using Welch's method.
+
+    Welch's method:
+    - Splits signal into overlapping windows (segments)
+    - Computes FFT on each window
+    - Averages the power spectra across all windows
+    - Result: Power Spectral Density (PSD) — much more stable than single FFT
+
+    SNR estimation:
+    - Signal power  = peak of the averaged PSD
+    - Noise power   = mean of PSD excluding the peak region
+    - SNR (dB)      = 10 * log10(signal_power / noise_power)
+
+    Note: we use 10*log10 here (not 20) because Welch gives us
+    power directly (amplitude²), not amplitude.
+
     Higher SNR = cleaner signal.
     """
-    _, magnitudes = compute_fft(signal, sample_rate)
-    magnitudes_np = to_numpy(magnitudes)
+    signal_np = to_numpy(signal)
 
-    peak = magnitudes_np.max()
-    noise_floor = np.median(magnitudes_np)
+    # Welch's PSD estimate
+    # nperseg: window size — 256 is a good balance of freq resolution vs averaging
+    freqs, psd = welch(signal_np, fs=sample_rate, nperseg=256)
 
-    if noise_floor == 0:
+    # Find peak (signal)
+    peak_idx = np.argmax(psd)
+    signal_power = psd[peak_idx]
+
+    # Noise = mean of all bins excluding a small window around the peak
+    # This avoids the signal itself contaminating the noise estimate
+    noise_mask = np.ones(len(psd), dtype=bool)
+    half_window = 5  # exclude 5 bins either side of peak
+    noise_mask[max(0, peak_idx - half_window): peak_idx + half_window + 1] = False
+    noise_power = np.mean(psd[noise_mask])
+
+    if noise_power == 0:
         return float('inf')
 
-    snr = 20 * np.log10(peak / noise_floor)
+    # 10*log10 because PSD is already in power units
+    snr = 10 * np.log10(signal_power / noise_power)
     return round(float(snr), 2)
 
 
 def compute_spectral_entropy(signal, sample_rate):
     """
-    Compute spectral entropy — a measure of signal complexity.
+    Compute spectral entropy using Welch's PSD instead of raw FFT magnitudes.
+
+    Using Welch here too gives a smoother, more stable probability
+    distribution for entropy calculation — less sensitive to single-frame noise.
+
     Low entropy  = simple signal (e.g. pure sine)
     High entropy = complex/noisy signal
     Returns: entropy score (float, 0 to 1 normalized)
     """
-    _, magnitudes = compute_fft(signal, sample_rate)
-    magnitudes_np = to_numpy(magnitudes)
+    signal_np = to_numpy(signal)
 
-    # Normalize to probability distribution
-    power = magnitudes_np ** 2
-    total = power.sum()
+    # Welch PSD
+    _, psd = welch(signal_np, fs=sample_rate, nperseg=256)
+
+    # Normalize PSD to probability distribution
+    total = psd.sum()
     if total == 0:
         return 0.0
-    prob = power / total
+    prob = psd / total
 
     # Shannon entropy
     prob = prob[prob > 0]  # avoid log(0)
     entropy = -np.sum(prob * np.log2(prob))
 
-    # Normalize by max possible entropy
+    # Normalize by max possible entropy (log2 of number of bins)
     max_entropy = np.log2(len(prob))
     normalized = entropy / max_entropy if max_entropy > 0 else 0.0
 
@@ -100,16 +131,39 @@ def analyze_signal(signal, sample_rate):
     """
     Full signal analysis — returns a dict of metrics.
     Used by adaptive_bitwidth.py to make bit-width decisions.
+    Runs Welch's PSD once and reuses for both SNR and entropy.
     """
-    snr = compute_snr(signal, sample_rate)
-    entropy = compute_spectral_entropy(signal, sample_rate)
-    freqs, mags = compute_fft(signal, sample_rate)
+    signal_np = to_numpy(signal)
+
+    # Run Welch once — reuse for both SNR and entropy
+    freqs_welch, psd = welch(signal_np, fs=sample_rate, nperseg=256)
+
+    # --- SNR from Welch PSD ---
+    peak_idx = np.argmax(psd)
+    signal_power = psd[peak_idx]
+    noise_mask = np.ones(len(psd), dtype=bool)
+    noise_mask[max(0, peak_idx - 5): peak_idx + 6] = False
+    noise_power = np.mean(psd[noise_mask])
+    snr = 10 * np.log10(signal_power / noise_power) if noise_power > 0 else float('inf')
+
+    # --- Spectral Entropy from Welch PSD ---
+    total = psd.sum()
+    prob = psd / total if total > 0 else psd
+    prob = prob[prob > 0]
+    entropy = -np.sum(prob * np.log2(prob))
+    max_entropy = np.log2(len(prob))
+    normalized_entropy = entropy / max_entropy if max_entropy > 0 else 0.0
+
+    # --- FFT for dashboard visualization (kept separate) ---
+    freqs_fft, mags_fft = compute_fft(signal, sample_rate)
 
     return {
-        "snr_db"          : snr,
-        "spectral_entropy": entropy,
-        "fft_freqs"       : freqs,
-        "fft_magnitudes"  : mags,
+        "snr_db"          : round(float(snr), 2),
+        "spectral_entropy": round(float(normalized_entropy), 4),
+        "fft_freqs"       : freqs_fft,
+        "fft_magnitudes"  : mags_fft,
+        "welch_freqs"     : freqs_welch,
+        "welch_psd"       : psd,
         "num_samples"     : len(signal),
         "sample_rate"     : sample_rate,
     }
